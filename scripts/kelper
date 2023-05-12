@@ -1,0 +1,232 @@
+#!/bin/bash
+
+version=0.1.0
+me=`basename "$0"`
+kelper_conf='kelper.cfg'
+
+# list commands
+commands() {
+    grep '^function' `dirname $0`'/'$me | sed 's/function /  /g;s/()//g;s/ # /\t/g'
+}
+
+# show version
+version() {
+    echo "$me version v$version"
+}
+
+# show script usage
+usage() {
+    echo "$me is a kelp bot helper."
+    echo ""
+    echo "---------------------------------------------------------------------------------"
+    echo "$me expects its config file $kelper_conf to be present in the current directory."
+    echo "If you intend to run multiple instances of $me (like a kelp bot farm), "
+    echo "best practice is to create multiple directories containing the required"
+    echo "config files, one for each instance."
+    echo ""
+    echo "$me depends on: kelp (obviously), curl, jq (to fetch and extract latest price)."
+    echo "These should be available in you shell PATH."
+    echo ""
+    echo "---------------------------------------------------------------------------------"
+    echo ""
+    echo "Usage: $me [COMMAND]... [OPTION]..."
+    echo ""
+    echo "Examples:"
+    echo "  $me price -m 0.5 2"
+    echo "  $me up -d -l"
+    echo "  $me status"
+    echo ""
+    echo "Commands:"
+    commands
+    echo ""
+    echo "Options:"
+    echo -e "  -m, \t\tWhen updating latest trade price for pendulum strategy, also set"
+    echo -e "      \t\t    MIN_PRICE and MAX_PRICE limits. The argument values in the"
+    echo -e "      \t\t    above example will set MIN_PRICE and MAX_PRICE limits to half"
+    echo -e "      \t\t    and double the current price, respectively."
+    echo -e "  -d, \t\tRun kelp in background"
+    echo -e "  -s, \t\tRun kelp in simulation mode"
+    echo -e "  -l, \t\tWrite kelp standard output to a log file"
+    echo -e "  -v, \t\tShow version"
+    echo -e "  -h, \t\tShow this help info"
+}
+
+# parse arguments
+while true; do
+  case "$1" in
+    price | up | status | stop | down ) command="$1"; shift ;;
+    -m ) min_price_multiplier=$2; max_price_multiplier=$3; shift 3 ;;
+    -d ) bg=true; shift ;;
+    -s ) sim=true; shift ;;
+    -l ) log=true; shift ;;
+    -v ) version; exit 0 ;;
+    -h ) usage; exit 0 ;;
+    * ) break ;;
+  esac
+done
+
+if [ ${@:+test} ] || [ ! ${command:+test} ] ; then
+    echo "Invalid argument list. Type '$me -h' for help."
+    exit 0
+fi
+
+# import config
+if [ ! -f $kelper_conf ]; then
+    echo "error: missing $kelper_conf"
+    exit 1
+fi
+
+source $kelper_conf > /dev/null 2>&1
+
+# validate config
+if [ ! $TRADER_CONF ]; then
+    echo "error: missing TRADER_CONF in $kelper_conf"
+    exit 1
+fi
+if [ ! $STRATEGY_CONF ]; then
+    echo "error: missing STRATEGY_CONF in $kelper_conf"
+    exit 1
+fi
+if [ ! $STRATEGY ]; then
+    echo "error: missing STRATEGY in $kelper_conf"
+    exit 1
+fi
+
+
+kelp-get-pid() {
+    # lsof -c kelp -w | grep $(pwd) | while read c1 c2 c3; do echo $c2; done
+    head -n1 kelp.pid 2>/dev/null
+}
+
+kelp-make-cmd() {
+    strat=$1
+    strat_conf=$2
+
+    cmd="kelp trade --no-headers -c $TRADER_CONF -s $strat"
+
+    if [ $strat_conf ] ; then
+        cmd="$cmd -f $strat_conf"
+    fi
+    if [ $sim ] ; then
+        cmd="$cmd --sim"
+    fi
+    if [[ $log || $cleanup_log ]] ; then
+        mkdir -p log
+        cmd="$cmd --log log/$strat"
+    fi
+    if [ $bg ] ; then
+        cmd="$cmd &>/dev/null"
+    fi
+    echo "$cmd" ; return
+}
+
+kelp-exec() {
+    strat=$1
+    strat_conf=$2
+    cmd=$(kelp-make-cmd $strat $strat_conf)
+    echo "$cmd"
+    eval "${cmd} &"
+    echo "$!" > kelp.pid
+    if [[ $log || $cleanup_log ]] ; then
+        sleep 0.1
+        latest_log=$(ls -rtl log/ | tail -1 | rev | cut -d' ' -f1 | rev)
+        ln -s -f $latest_log log/latest-$strat.log
+    fi
+}
+
+kelp-start() {
+    kelp-exec $STRATEGY $STRATEGY_CONF
+}
+
+kelp-is-running() {
+    pid=$(pgrep -F kelp.pid 2>/dev/null)
+    return "$?"
+}
+
+kelp-stop() {
+    pkill -F kelp.pid 2>/dev/null
+}
+
+kelp-cleanup() {
+    cleanup_log=true
+    kelp-exec 'delete'
+}
+
+
+function price()        # Update pendulum strategy config with latest trade price
+{
+    source $TRADER_CONF > /dev/null 2>&1
+
+    echo "Getting price for $ASSET_CODE_B ..."
+    url="https://lobstr.co/api/assets/alternative-rates/$ASSET_CODE_B:$ISSUER_B"
+    last_native_rate=`curl $url -s | jq '.last_native_rate.rate'`
+    echo "Got price $last_native_rate"
+
+    echo "Writing to $STRATEGY_CONF ..."
+    sed -i "s/SEED_LAST_TRADE_PRICE=.*/SEED_LAST_TRADE_PRICE=0${last_native_rate}0/" $STRATEGY_CONF
+    echo "Updated SEED_LAST_TRADE_PRICE to 0${last_native_rate}0"
+
+    if [ $min_price_multiplier ]; then
+        min_price=$( echo "$min_price_multiplier * $last_native_rate" | bc )
+        sed -i "s/MIN_PRICE=.*/MIN_PRICE=0${min_price}0/" $STRATEGY_CONF
+        echo "Updated MIN_PRICE to 0${min_price}0"
+    fi
+
+    if [ $max_price_multiplier ]; then
+        max_price=$( echo "$max_price_multiplier * $last_native_rate" | bc )
+        sed -i "s/MAX_PRICE=.*/MAX_PRICE=0${max_price}0/" $STRATEGY_CONF
+        echo "Updated MAX_PRICE to 0${max_price}0"
+    fi
+
+    echo "Done."
+}
+
+function up()       # Start kelp bot
+{
+    kelp-is-running
+    if [ "$?" -eq 0 ] ; then
+        echo "Already running (PID=`kelp-get-pid`)"
+    else
+        kelp-start
+        status
+    fi
+}
+
+function status()   # Show kelp bot status
+{
+    kelp-is-running
+    if [ "$?" -eq 0 ] ; then
+        echo "Running (PID=`kelp-get-pid`)"
+    else
+        echo "Stopped"
+        rm -f kelp.pid
+    fi
+}
+
+function stop()     # Stop kelp bot
+{
+    kelp-stop
+    status
+}
+
+function down()     # Stop kelp bot and delete all orders
+{
+    kelp-stop # stop the currently running instance
+    kelp-cleanup
+    status
+    # wait until all offers are purged and kelp starts sleeping
+    while ! grep 'sleeping' log/latest-delete.log > /dev/null; do
+        sleep 1
+    done;
+    # remove the cleanup log, unless it was requested
+    if [ ! $log ] ; then
+        rm -f $(readlink -f log/latest-delete.log)
+        rm -f log/latest-delete.log
+    fi
+    kelp-stop # stop the cleanup instance
+    status
+}
+
+$command
+
+exit 0
