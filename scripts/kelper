@@ -25,7 +25,7 @@ usage() {
     echo "config files, one for each instance."
     echo ""
     echo "$me depends on: kelp (obviously), curl, jq (to fetch and extract latest price)."
-    echo "These should be available in you shell PATH."
+    echo "These should be made available in your shell PATH."
     echo ""
     echo "---------------------------------------------------------------------------------"
     echo ""
